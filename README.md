@@ -1,70 +1,75 @@
 # DemandMind
 
-**DemandMind** is a machine learning project that predicts the **weekly sales** of an electronics retail store. Since predictions are weekly, monthly sales can simply be estimated by summing 4 consecutive weekly predictions.
+**DemandMind** predicts **weekly sales** (quantity ordered) for an electronics retail store, broken down by product. Since predictions are weekly, monthly sales can be estimated by summing 4 consecutive weekly predictions.
 
-The project ships with data that's already cleaned, plus the final feature-engineering steps needed before feeding it into the models. Two models are trained and compared in the main notebook:
-
-- **LinearRegression** — found in the **2nd cell** of the main notebook.
-- **XGBoostRegressor** — found in the **3rd cell** of the main notebook.
+The project repository includes the cleaned, feature-engineered dataset along with the trained model. Two models are trained, evaluated, and compared in the main notebook:
+1. **LinearRegression**
+2. **XGBoostRegressor**
 
 ---
 
-## Why two models? Are they different?
+## 🛠️ Data Preparation & Feature Engineering
 
-I trained two models to compare and pick the best one (I actually tried two more models early on, but dropped them to keep the final code clean).
+Sales data is inherently time-dependent, so every choice below exists to solve a specific problem that comes from that fact — not as a generic "best practice" checklist.
 
-For hyperparameter tuning, I combined **RandomizedSearchCV** and **HalvingGridSearchCV** — an approach from *Hands-On Machine Learning* (2025 edition): use `RandomizedSearchCV` first to narrow down the promising region of the parameter space, then refine within that region using a grid search. I used the **Halving** variant of grid search specifically because it progressively eliminates weak candidates and concentrates resources on the best ones, which converges to a strong estimator more efficiently than an exhaustive grid search.
+* **Chronological splitting — problem: future leakage.** A random or stratified split would let the model train on some weeks that come *after* the weeks it's tested on, which lets it implicitly "see the future" and produces test scores that look good but don't reflect real predictive ability. The dataset is instead split strictly by time — training on earlier weeks, testing on later ones — with no shuffling anywhere in the pipeline.
+* **A separate holdout set (`df_test`) — problem: needed an extra, harder guarantee against leakage.** Before the regular train/test split even happens, the most recent 10% of the data is carved off and set aside completely. The model never sees it during training, tuning, or the regular test evaluation — it's only used once, at the very end, to check performance on truly unseen future weeks.
+* **Lag & rolling features (`Qty_Lag_1`, `Qty_Rolling_3`) — problem: the model had no memory of recent demand.** Without these, the model only sees a snapshot (price, product, week) with no sense of what that product's demand was just doing. `Qty_Lag_1` gives it last period's quantity per product; `Qty_Rolling_3` gives it a 3-period rolling average per product to smooth out short-term noise. These turned out to matter a lot — they're a large part of why performance is as strong as it is.
+* **Cyclical week encoding (`Week_sin`, `Week_cos`) — problem: week numbers don't wrap around correctly.** Treating `Week` as a plain number tells the model week 52 and week 1 are as far apart as possible, when they're actually adjacent (one year rolling into the next). Sine/cosine transforms encode the week on a circle instead of a line, so the model sees that wraparound correctly.
+* **Log transformation of `Price_Each` — problem: extreme price outliers skewing the model.** Prices range from about 2.5 up to ~1700, with most values clustered around 400–1000 — a heavily right-skewed distribution that can disproportionately pull a model (especially LinearRegression) toward fitting the extremes. A `log1p` transform compresses that scale before the values are standardized with `StandardScaler`.
+* **Log transformation of the target (`Quantity_Ordered`) — same problem, applied to the label.** Demand itself spikes unevenly across products and periods. The target is log-transformed during training via `TransformedTargetRegressor` (`log1p` in, `expm1` out), so the model trains on a more stable scale and predictions are automatically converted back to real quantities.
+* **`OneHotEncoder` for `Product`** — standard categorical encoding, since product is a category with no inherent order.
 
-The two models are conceptually very different, even though they're used the same way in this project:
-- **LinearRegression** fits a straight line (a linear combination of the features) that the data is assumed to be distributed around.
-- **XGBoostRegressor** builds an ensemble of decision trees, where predictions come from combining the outputs of many trees.
+---
 
-## What's the best model, based on this data and these results?
+## 🤖 Model Optimization & Tuning
 
-Neither model exceeded **~66% R²** on the (chronological) test set, and on that headline number they're close. But looking past R² alone, **LinearRegression edges out XGBoostRegressor** on this dataset:
+For **XGBoostRegressor**, hyperparameter tuning is a two-stage search, wrapped inside the same `TransformedTargetRegressor` used for the target log-transform:
+1. **`RandomizedSearchCV`** broadly explores the hyperparameter space (tree depth, learning rate, subsample/colsample ratios) using `TimeSeriesSplit` cross-validation, to cheaply locate a promising region without an exhaustive search.
+2. **`GridSearchCV`** then fine-tunes around the best parameters found by the randomized search — a small, focused grid rather than a large one, since the search space has already been narrowed.
 
-- Across RMSE, MAE, and MSE on the test set, LinearRegression is slightly better than XGBoostRegressor.
-- LinearRegression is dramatically cheaper to train — a couple of seconds, versus roughly 2 minutes for XGBoostRegressor (which runs both `RandomizedSearchCV` and `HalvingGridSearchCV` for tuning).
-- XGBoostRegressor does come out ahead on cross-validated R² specifically.
+This combination — random search to find the right neighborhood, then grid search to refine within it — follows the approach described in *Hands-On Machine Learning*.
 
-So while it's close, LinearRegression is arguably the more practical choice here: comparable (in some metrics, better) accuracy at a fraction of the training cost. Full metrics for both models are in the notebook.
+---
 
-### A note on cross-validation
+## 📊 Cross-Validation & Evaluation Strategy
 
-Early on, cross-validation (a plain, non-time-aware `KFold`-style split) produced a **negative R²** for LinearRegression on some folds — meaning it performed worse than simply predicting the mean. The cause was that this CV split data **randomly rather than chronologically**, so some folds ended up training on later weeks and evaluating on earlier ones (or vice versa), breaking the time-dependent structure the model relies on (e.g. the week/day features).
+Problem this section solves: an earlier version of this project used standard random `KFold` cross-validation, which — for the same future-leakage reason as above — produced **negative R² scores**: some folds ended up training on later weeks and evaluating on earlier ones, breaking the time-dependent structure the model relies on. Replacing it with **`TimeSeriesSplit` (`n_splits=5`)** for *every* CV call, for both models, fixed this: every fold now trains strictly on a historical slice and evaluates on a subsequent one.
 
-Once evaluated in a way that respects time order — training on earlier periods, evaluating on later ones — results were consistent and sensible again, including RMSE staying appropriately larger than MAE (expected, since squaring penalizes large errors more).
+* Metrics tracked: R², RMSE, and MAE — on cross-validation, on the regular train/test split, and separately on the `df_test` holdout.
+* RMSE is consistently ≥ MAE across results, as expected mathematically (squaring penalizes large errors more than the absolute-value term does) — a useful sanity check that the numbers are internally consistent.
 
-**Known limitation:** the CV setup used during experimentation was not time-aware. A more rigorous version of this project would use `TimeSeriesSplit` (or an equivalent rolling/expanding-window CV) throughout, rather than relying on a single chronological train/test split. This is a good next step for anyone building on this project.
+---
 
-I also ran a quick exploratory test late in development: generating a new, synthetic dataset (substantially different from the original data) with a clean chronological structure, and scoring the trained model on it — which returned a higher accuracy (~82–85%). This is **not** treated as a reliable generalization metric here, since synthetic data is typically simpler/less noisy than real data and isn't necessarily representative of new real-world samples the way the original test set is. It's included as a side note, not as evidence of model performance — the **~62–66% test R² above is the trustworthy number**.
+## 📈 Model Performance & Comparison
 
-## Data preparation notes
+| Metric | LinearRegression | XGBoostRegressor |
+| :--- | :---: | :---: |
+| Train R² | 0.9353 | 0.9735 |
+| Test R² | 0.8054 | 0.7263 |
+| Mean CV R² (TimeSeriesSplit) | 0.9330 | 0.9531 |
+| **Holdout R² (`df_test`, unseen future weeks)** | **0.8768** | **0.3802** |
+| Holdout MAE | 24.15 | 51.77 |
+| Holdout RMSE | 32.49 | 72.88 |
+| Training time | ~0.02 s | ~10 s (random + grid search) |
 
-A few things worth knowing about how the data was prepared before training:
+### Key takeaway: LinearRegression is the better model here
 
-- **This is time-series data, treated as such.** Two engineered columns — week and day — were added, and the **train/test split is chronological**, not random. The model is trained on earlier periods and evaluated on later ones, so it never trains on the "future" to predict the "past."
-- **I initially tried a random/stratified split** to see if it would help. It didn't — it actually made things worse (test accuracy dropped to ~8%, down from ~13–14% with a proper time-based split). This makes sense in hindsight: shuffling time-series data before splitting lets information from later weeks leak into training, so the resulting metrics aren't just lower, they're not trustworthy in the first place. This confirmed that a chronological split was the correct approach for this problem, and it's what the final version uses.
-- **Log transformation** was applied to skewed numeric features — notably price, which ranges from as low as **2.49** up to **1700**, with most values clustered around **400–1000**. This right-skewed distribution can disproportionately influence the model (especially LinearRegression), so a log transform was used to compress the scale and reduce the impact of extreme values.
-- **Categorical encoding:** `OneHotEncoder` was used for categorical features.
-- Because the data is time-ordered, it was **not shuffled** at any point before splitting.
+On the regular test split and on cross-validation, XGBoost looks slightly ahead of LinearRegression. But on `df_test` — real, chronologically later data the model never touched in any form during training or tuning — **XGBoost's R² collapses from 0.73 to 0.38**, while LinearRegression's *improves* to 0.88.
 
-### Before vs. after these adjustments
+Read together with XGBoost's higher train R² (0.97 vs. 0.94), this is a textbook overfitting signature: XGBoost is picking up fine-grained patterns specific to the training period that don't hold up on new time periods, while the simpler linear model generalizes more reliably. Combined with being roughly 500x faster to train, **LinearRegression is the practical choice for this problem** — the saved model (`DemandMind.pkl`) is the LinearRegression pipeline.
 
-| | Before tuning/preprocessing | After |
-|---|---|---|
-| Train accuracy | ~14% | ~80–82% |
-| Test accuracy | ~13% | ~62–66% |
+---
 
-All other metrics (RMSE, MAE, MSE) are shown in the notebook.
+## 📁 Repository Structure
 
-## Project structure
+* `demandmind.ipynb` — the main notebook: data loading, time-based feature engineering, chronological + holdout splitting, both model pipelines, hyperparameter tuning, and full evaluation.
+* `electronic-store-sales_cleaned.csv` — the cleaned, feature-engineered dataset (excludes the final holdout slice), ready to feed into the models.
+* `DemandMind.pkl` — the saved LinearRegression pipeline (via `joblib`), ready for inference.
 
-- **`Core.ipynb`** ([Python](./Python)) — the main notebook. Loads the data (path is set to my local Kaggle path — update it to your own), applies the final preprocessing steps described above, and trains both models.
-- **`SalesModel.ipynb`** ([Python](./Python)) — the notebook that performs the initial data cleaning, from the raw data onward.
-- **`Model/`** — contains the final, fully processed dataset (ready to feed directly into the model) and the trained model itself.
+---
 
-## Evaluation metrics
+## 📐 Evaluation Metrics
 
 $$\text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^{n} (y_i - \hat{y}_i)^2}$$
 
