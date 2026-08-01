@@ -62,8 +62,10 @@ Read together with XGBoost's higher train R² (0.97 vs. 0.94), this is a textboo
 ---
 
 ## 📁 Repository Structure
-
+* Inside `Python` you will find :
 * `demandmind.ipynb` — the main notebook: data loading, time-based feature engineering, chronological + holdout splitting, both model pipelines, hyperparameter tuning, and full evaluation.
+* `salesmodel.ipynb` — the first code that get the raw data and clean it.
+* Inside `Model` you will find :
 * `electronic-store-sales_cleaned.csv` — the cleaned, feature-engineered dataset (excludes the final holdout slice), ready to feed into the models.
 * `DemandMind.pkl` — the saved LinearRegression pipeline (via `joblib`), ready for inference.
 
